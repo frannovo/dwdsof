@@ -1,0 +1,151 @@
+version: "3"
+services:
+  # CI/CD SERVER
+  jenkins.oss.local:
+    build:
+      context: ./jenkins
+    image: jenkins:twsoss2019
+    ports:
+      - '8081:8080'
+      - '8443:8443'
+    volumes:
+      - './data/jenkins_data:/var/jenkins_home'
+      # Docker in Docker
+      - /var/run/docker.sock:/var/run/docker.sock
+  # SAST
+  sonar.oss.local:
+    image: sonarqube
+    depends_on:
+      - db
+    ports:
+      - "9000:9000"
+    environment:
+      - sonar.jdbc.url=jdbc:postgresql://db:5432/sonar
+    volumes:
+      - './data/sonarqube_conf:/opt/sonarqube/conf'
+      - './data/sonarqube_data:/opt/sonarqube/data'
+      - './data/sonarqube_extensions:/opt/sonarqube/extensions'
+  db:
+    image: postgres
+    environment:
+      - POSTGRES_USER=sonar
+      - POSTGRES_PASSWORD=sonar
+    volumes:
+      - './data/postgresql:/var/lib/postgresql'
+      # This needs explicit mapping due to https://github.com/docker-library/postgres/blob/4e48e3228a30763913ece952c611e5e9b95c8759/Dockerfile.template#L52
+      - './data/postgresql_data:/var/lib/postgresql/data'
+  # VULN. TRACKER  
+  uwsgi:
+    build:
+      context: ./django-DefectDojo
+      dockerfile: Dockerfile.django
+    image: oss2019/defectdojo-django:1.0
+    depends_on:
+      - mysql
+    entrypoint: ['/wait-for-it.sh', 'mysql:3306', '-t', '30', '--', '/entrypoint-uwsgi.sh']
+    environment:
+      DD_DEBUG: 'off'
+      DD_ALLOWED_HOSTS: ${DD_ALLOWED_HOSTS:-*}
+      DD_DATABASE_URL: ${DD_DATABASE_URL:-mysql://defectdojo:defectdojo@mysql:3306/defectdojo}
+      DD_CELERY_BROKER_USER: ${DD_CELERY_BROKER_USER:-guest}
+      DD_CELERY_BROKER_PASSWORD: ${DD_CELERY_BROKER_USER:-guest}
+  dd.oss.local:
+    image: defectdojo/defectdojo-nginx:latest
+    depends_on:
+      - uwsgi
+    ports:
+      - "8082:8080"
+  celerybeat:
+    image: defectdojo/defectdojo-django:latest
+    depends_on:
+      - mysql
+      - rabbitmq
+    entrypoint: ['/wait-for-it.sh', 'mysql:3306', '-t', '30', '--', '/entrypoint-celery-beat.sh']
+    environment:
+      DD_DATABASE_URL: ${DD_DATABASE_URL:-mysql://defectdojo:defectdojo@mysql:3306/defectdojo}
+      DD_CELERY_BROKER_USER: ${DD_CELERY_BROKER_USER:-guest}
+      DD_CELERY_BROKER_PASSWORD: ${DD_CELERY_BROKER_USER:-guest}
+  celeryworker:
+    image: defectdojo/defectdojo-django:latest
+    depends_on:
+      - mysql
+      - rabbitmq
+    entrypoint: ['/wait-for-it.sh', 'mysql:3306', '-t', '30', '--', '/entrypoint-celery-worker.sh']
+    environment:
+      DD_DATABASE_URL: ${DD_DATABASE_URL:-mysql://defectdojo:defectdojo@mysql:3306/defectdojo}
+      DD_CELERY_BROKER_USER: ${DD_CELERY_BROKER_USER:-guest}
+      DD_CELERY_BROKER_PASSWORD: ${DD_CELERY_BROKER_USER:-guest}
+  initializer:
+    image: defectdojo/defectdojo-django:latest
+    depends_on:
+      - mysql
+    entrypoint: ['/wait-for-it.sh', 'mysql:3306', '--', '/entrypoint-initializer.sh']
+    environment:
+      DD_DATABASE_URL: ${DD_DATABASE_URL:-mysql://defectdojo:defectdojo@mysql:3306/defectdojo}
+      DD_ADMIN_USER: ${DD_ADMIN_USER:-admin}
+      DD_ADMIN_MAIL: ${DD_ADMIN_USER:-admin@defectdojo.local}
+      DD_ADMIN_FIRST_NAME: ${DD_ADMIN_FIRST_NAME:-Admin}
+      DD_ADMIN_LAST_NAME: ${DD_ADMIN_LAST_NAME:-User}
+      DD_INITIALIZE: ${DD_INITIALIZE:-true}
+  mysql:
+    image: mysql:5.7
+    environment:
+      MYSQL_RANDOM_ROOT_PASSWORD: 'yes'
+      DD_DATABASE_URL: ${DD_DATABASE_URL:-mysql://defectdojo:defectdojo@mysql:3306/defectdojo}
+      MYSQL_USER: ${DD_DATABASE_USER:-defectdojo}
+      MYSQL_PASSWORD: ${DD_DATABASE_PASSWORD:-defectdojo}
+      MYSQL_DATABASE: ${DD_DATABASE_NAME:-defectdojo}
+    command: ['mysqld', '--character-set-server=utf8mb4', '--collation-server=utf8mb4_unicode_ci']
+    volumes:
+      - './data/mysql_data:/var/lib/mysql'
+  rabbitmq:
+    image: rabbitmq:3.7
+  # ISSUE TRACKER
+  jira.oss.local:
+    depends_on:
+      - postgresql
+    build:
+      context: ./jira
+    image: teamatldocker/jira
+    volumes:
+      - './data/jira_data:/var/atlassian/jira'
+    ports:
+      - '8083:8080'
+    environment:
+      - 'JIRA_DATABASE_URL=postgresql://jira@postgresql/jiradb'
+      - 'JIRA_DB_PASSWORD=fHx7tApjtuF5G5=!'
+      - 'SETENV_JVM_MINIMUM_MEMORY=2048m'
+      - 'SETENV_JVM_MAXIMUM_MEMORY=4096m'
+      - 'JIRA_PROXY_NAME='
+      - 'JIRA_PROXY_PORT='
+      - 'JIRA_PROXY_SCHEME='
+    logging:
+      # limit logs retained on host to 25MB
+      driver: "json-file"
+      options:
+        max-size: "500k"
+        max-file: "50"
+  postgresql:
+    image: postgres:9.5-alpine
+    volumes:
+      - './data/jira_postgresqldata:/var/lib/postgresql/data'
+    environment:
+      - 'POSTGRES_USER=jira'
+      - 'POSTGRES_PASSWORD=fHx7tApjtuF5G5=!'
+      - 'POSTGRES_DB=jiradb'
+      - 'POSTGRES_ENCODING=UNICODE'
+      - 'POSTGRES_COLLATE=C'
+      - 'POSTGRES_COLLATE_TYPE=C'
+    logging:
+      # limit logs retained on host to 25MB
+      driver: "json-file"
+      options:
+        max-size: "500k"
+        max-file: "50"
+  selenium:
+    image: selenium/standalone-chrome:3.141.59-oxygen
+    ports:
+      - "4444:4444"
+    volumes:
+      - /dev/shm:/dev/shm
+      

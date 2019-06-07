@@ -1,0 +1,180 @@
+properties([
+    parameters([
+        string(name: 'REPOSITORY_URL', defaultValue: 'https://github.com/frannovo/juice-shop.git', description: 'Git repository url', ),
+        string(name: 'BUILD_COMMAND', defaultValue: 'npm install --unsafe-perm --no-audit', description: 'Command to execute in Build stage'),
+        string(name: 'BUILD_IMAGE', defaultValue: 'node:10', description: 'Image to use in Build stage'),
+        string(name: 'BUILD_ENVARS', defaultValue: 'npm_config_cache=npm-cache,HOME=.', description: 'Comma separated key=value'),
+        string(name: 'DEPENDENCY_CHECK_ARGS', defaultValue: '--disableOssIndex --disableRetireJS --disableRubygems --disableBundleAudit --disableNuspec --disableAssembly --format ALL', description: 'Dependency Check arguents'),
+        string(name: 'SONAR_SOURCES', defaultValue: '.', description: 'Source code folder'),
+        string(name: 'SONAR_URL', defaultValue: 'sonar.env.local:9000', description: 'SonarQube server url'),
+        string(name: 'SONAR_EXCLUSIONS', defaultValue: '**/node_modules/**/*', description: 'SonarQube scanner exclusions'),
+        string(name: 'DEFECT_DOJO_URL', defaultValue: 'dd.env.local:8080', description: 'Defect Dojo url'),
+        string(name: 'JIRA_URL', defaultValue: 'jira.env.local:8080', description: 'Jira url'),
+        string(name: 'JIRA_PROJECT_KEY', defaultValue: 'JS', description: 'Jira Project key'),
+        booleanParam(name: 'DAST_ENABLED', defaultValue: true, description: 'Enable/Disable DAST stage')
+    ])
+])
+
+node {
+    def shortCommit
+    def jenkins_container_id = sh(script: 'grep docker /proc/self/cgroup | awk -F\'/\' \'{print $NF}\' | head -1', returnStdout: true).trim()
+    def shared_network = sh(script: "docker inspect ${jenkins_container_id} -f '{{json .NetworkSettings.Networks }}' | jq 'to_entries[] | .key' | sed 's/\"//g'",returnStdout: true).trim()
+
+    wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'XTerm']) {
+        withEnv([
+            "REPOSITORY_URL=${params.REPOSITORY_URL}",
+            "BUILD_COMMAND=${params.BUILD_COMMAND}",
+            "BUILD_IMAGE=${params.BUILD_IMAGE}",
+            "DEPENDENCY_CHECK_ARGS=${params.DEPENDENCY_CHECK_ARGS}",
+            "SONAR_EXCLUSIONS=${params.SONAR_EXCLUSIONS}",
+            "SONAR_URL=${params.SONAR_URL}",
+            "DEFECT_DOJO_URL=${params.DEFECT_DOJO_URL}",
+            "DEPENDENCY_CHECK_FILE=${WORKSPACE}/dependency-check-report.xml",
+            "sonar_project_key=${JOB_BASE_NAME.toLowerCase().trim()}",
+            "sonar_project_name=${JOB_BASE_NAME}",
+            "project_key=${params.JIRA_PROJECT_KEY}"
+        ]){
+            stage('Checkout') {
+                deleteDir()
+                git url: "${env.REPOSITORY_URL}"
+                shortCommit = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
+            }
+            stage ('Build') {
+                def BUILD_ENVARS = params.BUILD_ENVARS.split(',') as List
+                withEnv(BUILD_ENVARS) {
+                    docker.image("${BUILD_IMAGE}").inside() {
+                        sh "${BUILD_COMMAND}"
+                    }
+                }
+            }
+            stage ('Dependency Check') {
+                try {
+                    sh "mkdir -p ${JENKINS_HOME}/dc-data && chmod 0777 ${JENKINS_HOME}/dc-data -R"
+                    docker.image('owasp/dependency-check').inside('-v "${JENKINS_HOME}/dc-data":/usr/share/dependency-check/data --entrypoint=""') {
+                        sh "/usr/share/dependency-check/bin/dependency-check.sh --out ./ --scan '${WORKSPACE}' ${env.DEPENDENCY_CHECK_ARGS} --project '${JOB_BASE_NAME}'"
+                    }
+                    publishHTML (target: [
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: false,
+                        keepAll: true,
+                        reportDir: './',
+                        reportFiles: 'dependency-check-report.html',
+                        reportName: "Dependency-Check-Report"
+                    ])
+                    // Workarround Findings.SEVERITY_CHOICES
+                    sh "sed -i 's/severity>moderate/severity>medium/g' dependency-check-report.xml"
+                    withCredentials([string(credentialsId: 'devops-dd-token', variable: 'TOKEN'), usernamePassword(credentialsId: 'devops-credentials', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                        sh "${JENKINS_HOME}/scripts/import.sh dependency-check"
+                    }
+                    
+                } catch (Exception err) {
+                    echo err.toString()
+                    echo err.getMessage()
+                }
+            }
+            
+            stage('SAST Sonar') {
+                try {
+                    docker.image('newtmitch/sonar-scanner:alpine').inside("--network ${shared_network} -u root --entrypoint=''") {
+sh """ 
+sonar-scanner -Dsonar.host.url=http://${SONAR_URL} \
+    -Dsonar.projectKey=${sonar_project_key} \
+    -Dsonar.projectName=\"${sonar_project_name}\" \
+    -Dsonar.projectVersion=${shortCommit} \
+    -Dsonar.exclusions=${SONAR_EXCLUSIONS} \
+    -Dsonar.projectBaseDir=${WORKSPACE} \
+    -Dsonar.sources=${SONAR_SOURCES}
+"""
+                        sh "rm -rf .scannerwork"
+                    }
+                    withCredentials([string(credentialsId: 'devops-dd-token', variable: 'TOKEN'), usernamePassword(credentialsId: 'devops-credentials', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                        sh "sleep 30" // wait for sonar server process scanner
+                        sh "${JENKINS_HOME}/scripts/import.sh sonar"
+                    } 
+                } catch (err) {
+                    echo err.toString()
+                    echo err.getMessage()
+                }
+            }
+            if ( DAST_ENABLED ) {
+                stage('DAST') {
+                    try {
+                        withCredentials([string(credentialsId: 'zap-api-token', variable: 'ZAP_API_TOKEN')]) {
+sh """
+docker run -d --rm -u zap --network ${shared_network} --name zap -p '8888:8888' -v '${WORKSPACE}/zap/scripts':/zap/scripts -v '${WORKSPACE}/zap/policies':/home/zap/.ZAP/policies -v '${WORKSPACE}/zap/contexts':/home/zap/.ZAP/contexts owasp/zap2docker-stable \
+sh -c 'sed -i "s/SET FILES CACHE SIZE 10000/SET FILES CACHE SIZE 50000/" db/zapdb.script && \
+sed -i "s/SET FILES SCALE 64/SET FILES SCALE 128/" db/zapdb.script && \
+zap.sh -daemon \
+    -host 0.0.0.0 \
+    -port 8888 \
+    -config api.addrs.addr.name=".*" \
+    -config api.addrs.addr.regex=true \
+    -config api.key=${ZAP_API_TOKEN}'
+"""
+                        }
+                    } catch (err) {
+                        echo "[ERROR] Running ZAP"
+                        echo err.toString()
+                        echo err.getMessage()
+                    }
+                    try {
+                    waitUntil {
+                        def r = sh script: 'timeout 60 wget --retry-connrefused --tries=60 --waitretry=1 -q http://zap:8888 -O /dev/null', returnStatus: true
+                        return (r == 0);
+                    }
+                    docker.image("${BUILD_IMAGE}").inside("--network ${shared_network} --name juiceshop.com") {
+                        sh "${WORKSPACE}/node_modules/protractor/bin/webdriver-manager update"
+                        sh "npm run e2e"
+                    }
+                    } catch (err) {
+                        echo "[ERROR] Running APP"
+                        echo err.toString()
+                        echo err.getMessage()
+                    }
+                    try {
+                        sh "docker run -d --rm --network ${shared_network} --name juiceshop.com -p 3000 -w '${WORKSPACE}' -v '${WORKSPACE}':'${WORKSPACE}' node:10 npm start"
+                    } catch (err) {
+                        echo "[ERROR] Running NPM start"
+                        echo err.toString()
+                        echo err.getMessage()
+                    }
+                    try {
+                        waitUntil {
+                            def r = sh script: 'timeout 60 wget --retry-connrefused --tries=60 --waitretry=1 -q http://zap:8888 -O /dev/null', returnStatus: true
+                            return (r == 0);
+                        }
+                        withCredentials([string(credentialsId: 'zap-api-token', variable: 'ZAP_API_TOKEN')]) {
+                            sh "curl -s 'http://zap:8888/JSON/context/action/importContext/?zapapiformat=JSON&apikey=${ZAP_API_TOKEN}&formMethod=GET&contextFile=juiceshop.context'"
+                            sh "curl -s 'http://zap:8888/JSON/script/action/load/?zapapiformat=JSON&apikey=${ZAP_API_TOKEN}&formMethod=GET&scriptName=bearer&scriptType=httpsender&scriptEngine=ECMAScript+%3A+Oracle+Nashorn&fileName=scripts%2Fbearer.js&scriptDescription=&charset='"
+                            sh "curl -s 'http://zap:8888/JSON/script/action/enable/?zapapiformat=JSON&apikey=${ZAP_API_TOKEN}&formMethod=GET&scriptName=bearer'"
+                        
+                            waitUntil {
+                                def r = sh script: 'timeout 60 wget --retry-connrefused --tries=60 --waitretry=1 -q http://juiceshop.com:3000 -O /dev/null', returnStatus: true
+                                return (r == 0);
+                            }
+                            sh "curl -i -X POST -H 'Content-Type: application/json' -d @${JENKINS_HOME}/zap/payloads/payload.json 'http://juiceshop.com:3000/api/Users/'"
+                            // Launch active scan
+                            sh "curl -s 'http://zap:8888/JSON/ascan/action/scan/?zapapiformat=JSON&apikey=${ZAP_API_TOKEN}&formMethod=GET&url=http%3A%2F%2Fjuiceshop.com%3A3000&recurse=true&inScopeOnly=&scanPolicyName=oss&method=&postData=&contextId=1'"
+                            waitUntil {
+                                // Wait for 100% scan
+                                def r = sh script: "curl -s 'http://zap:8888/JSON/ascan/view/status/?zapapiformat=JSON&apikey=${ZAP_API_TOKEN}&formMethod=GET&scanId=0' | grep 100", returnStatus: true
+                                return (r == 0)
+                            }
+                            sh "curl -s --output zap-report.xml 'http://zap:8888/OTHER/core/other/xmlreport/?apikey=${ZAP_API_TOKEN}&formMethod=GET'"
+                            withCredentials([string(credentialsId: 'devops-dd-token', variable: 'TOKEN'), usernamePassword(credentialsId: 'devops-credentials', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                                sh "${JENKINS_HOME}/scripts/import.sh zap"
+                            }
+                        }
+                    } catch (err) {
+                        echo "[ERROR] Running ZAP Active Scan"
+                        echo err.toString()
+                        echo err.getMessage()
+                    } finally {
+                        // We need to
+                        sh "docker rm -f zap && docker rm -f juiceshop.com"
+                    }
+                } //
+            } // DAST_ENABLED check
+        } // withEnv
+    } // wrap AnsiColor
+} // node
